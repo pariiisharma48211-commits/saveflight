@@ -1,0 +1,128 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h>
+
+// ---------- PINS ----------
+const int TRIG_PIN  = 9;
+const int ECHO_PIN  = 10;
+const int SOUND_PIN = A0;
+const int LDR_PIN   = A1;
+const int SERVO_PIN = 6;
+const int RELAY_PIN = 7;
+const int LED_PIN   = 8;
+
+// ---------- SETTINGS (calibrate with Serial Monitor) ----------
+const bool RELAY_ACTIVE_LOW = true;  // if relay works backwards, set false
+const int  DANGER_CM        = 40;    // perimeter radius in cm (change to resize)
+const int  DARK_THRESHOLD   = 300;   // LDR below this = NIGHT
+const int  SOUND_THRESHOLD  = 120;   // sound swing above this = noise
+const int  SERVO_NORMAL     = 0;     // degrees
+const int  SERVO_BRAKE      = 90;    // degrees
+const unsigned long ALERT_HOLD_MS = 4000;  // alert stays 4 s after object leaves
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);  // try 0x3F if screen stays blank
+Servo brakeServo;
+
+long distanceCm = 999;
+int  soundLevel = 0, lux = 0, effectiveCm = DANGER_CM;
+bool isNight = false, inPerimeter = false, alertActive = false;
+unsigned long alertUntil = 0, lastLoop = 0, lastLcd = 0;
+
+void relaySet(bool on) {
+  digitalWrite(RELAY_PIN, (on ^ RELAY_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+long readDistance() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long d = pulseIn(ECHO_PIN, HIGH, 25000);   // 25 ms timeout
+  if (d == 0) return 999;                    // nothing in range
+  return d * 0.034 / 2;
+}
+
+int readSoundSwing() {
+  int mn = 1023, mx = 0;
+  for (int i = 0; i < 50; i++) {
+    int v = analogRead(SOUND_PIN);
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  return mx - mn;
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  relaySet(false);
+  digitalWrite(LED_PIN, LOW);
+  brakeServo.attach(SERVO_PIN);
+  brakeServo.write(SERVO_NORMAL);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("SafeFlight");
+  lcd.setCursor(0, 1); lcd.print("Booting...");
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ---- Sensor loop, every ~100 ms ----
+  if (now - lastLoop >= 100) {
+    lastLoop = now;
+
+    distanceCm = readDistance();
+    soundLevel = readSoundSwing();
+    lux        = analogRead(LDR_PIN);
+    isNight    = (lux < DARK_THRESHOLD);
+
+    // Night = silent owls, so widen the perimeter by 50%
+    effectiveCm = isNight ? (DANGER_CM * 3 / 2) : DANGER_CM;
+
+    bool bird = (distanceCm < effectiveCm);
+    // Noise + object fairly close = extra confidence (flocks)
+    if (soundLevel > SOUND_THRESHOLD && distanceCm < effectiveCm * 2) bird = true;
+
+    inPerimeter = bird;                       // live status for the LED
+    if (bird) {                               // latch alert for 4 s
+      alertActive = true;
+      alertUntil = now + ALERT_HOLD_MS;
+    }
+
+    Serial.print("Dist:");  Serial.print(distanceCm);
+    Serial.print(" Snd:");  Serial.print(soundLevel);
+    Serial.print(" LDR:");  Serial.print(lux);
+    Serial.print(" Zone:"); Serial.print(effectiveCm);
+    Serial.print(" LED:");  Serial.println(inPerimeter ? "ON" : "OFF");
+  }
+
+  // ---- Outputs ----
+  if (alertActive && now < alertUntil) {
+    relaySet(true);
+    brakeServo.write(SERVO_BRAKE);
+  } else {
+    alertActive = false;
+    relaySet(false);
+    brakeServo.write(SERVO_NORMAL);
+  }
+  digitalWrite(LED_PIN, inPerimeter ? HIGH : LOW);
+
+  // ---- LCD refresh ----
+  if (now - lastLcd >= 300) {
+    lastLcd = now;
+    lcd.setCursor(0, 0);
+    lcd.print(alertActive ? "!! BIRD ALERT !! " : "Status: SAFE     ");
+    lcd.setCursor(0, 1);
+    lcd.print("D:");
+    lcd.print(distanceCm > 999 ? 999 : distanceCm);
+    lcd.print("cm ");
+    lcd.print(isNight ? "NIGHT " : "DAY   ");
+    lcd.print("   ");
+  }
+}
